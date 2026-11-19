@@ -1,0 +1,96 @@
+name: CI & deploy to cPanel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci # also runs `prisma generate` (postinstall)
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+        env:
+          NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+          NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME: ${{ vars.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME }}
+          NEXT_PUBLIC_RAZORPAY_KEY_ID: ${{ vars.NEXT_PUBLIC_RAZORPAY_KEY_ID }}
+
+      - name: Assemble standalone bundle
+        run: |
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+          mkdir -p .next/standalone/tmp
+          # Fail if any native binary slipped into the bundle (cPanel must not need native builds).
+          if find .next/standalone -name "*.node" | grep -q .; then
+            echo "Native .node binaries found in standalone bundle:"; find .next/standalone -name "*.node"; exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: standalone
+          path: .next/standalone
+          include-hidden-files: true
+          retention-days: 7
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: standalone
+          path: standalone
+
+      - name: Upload over SFTP
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          SFTP_PATH: ${{ secrets.SFTP_PATH }}
+          SFTP_PRIVATE_KEY: ${{ secrets.SFTP_PRIVATE_KEY }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+          mkdir -p ~/.ssh
+          echo "$SFTP_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${SFTP_PORT:-22}" "$SFTP_HOST" >> ~/.ssh/known_hosts
+          # Mirror the bundle into the app root. tmp/ (Passenger restart file) and logs are kept.
+          lftp -e "set sftp:connect-program 'ssh -a -x -i ~/.ssh/deploy_key -p ${SFTP_PORT:-22}'; \
+                   set net:max-retries 3; \
+                   mirror --reverse --delete --parallel=4 --exclude-glob tmp/ --exclude-glob '*.log' standalone/ $SFTP_PATH/; \
+                   bye" \
+               -u "$SFTP_USER," "sftp://$SFTP_HOST"
+
+      - name: Restart Passenger (touch tmp/restart.txt)
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          SFTP_PATH: ${{ secrets.SFTP_PATH }}
+        run: |
+          # Uploading a fresh file updates its mtime, which is what Passenger watches. Works with SFTP-only accounts.
+          date > restart.txt
+          lftp -e "set sftp:connect-program 'ssh -a -x -i ~/.ssh/deploy_key -p ${SFTP_PORT:-22}'; \
+                   mkdir -pf $SFTP_PATH/tmp; \
+                   put restart.txt -o $SFTP_PATH/tmp/restart.txt; \
+                   bye" \
+               -u "$SFTP_USER," "sftp://$SFTP_HOST"
