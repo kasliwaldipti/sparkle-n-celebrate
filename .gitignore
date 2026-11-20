@@ -43,3 +43,6 @@ next-env.d.ts
 
 /src/generated/prisma
 .neon
+
+# Private notes, kept local until launch
+DEPLOY.md
