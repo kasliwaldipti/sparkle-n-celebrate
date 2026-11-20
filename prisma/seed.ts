@@ -1,10 +1,13 @@
-import "dotenv/config";
+import { config } from "dotenv";
+
+// `neon env pull` writes .env.local; .env still works as a fallback.
+config({ path: [".env.local", ".env"], quiet: true });
 import bcrypt from "bcryptjs";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/prisma/client";
 
 const db = new PrismaClient({
-  adapter: new PrismaPg({ connectionString: process.env.DIRECT_URL ?? process.env.DATABASE_URL }),
+  adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL }),
 });
 
 const categories = [
